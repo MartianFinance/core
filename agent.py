@@ -1,91 +1,87 @@
-from uagents import Agent, Context, Model
+from datetime import datetime, timezone
+from uuid import uuid4
+from uagents import Agent, Context, Model, Protocol
+from uagents.setup import fund_agent_if_low
+from uagents_core.contrib.protocols.chat import (
+    ChatAcknowledgement,
+    ChatMessage,
+    EndSessionContent,
+    StartSessionContent,
+    TextContent,
+    chat_protocol_spec,
+)
+from uagents_core.types import DeliveryStatus
 
-# --- Message Models for Control ---
+# Import shared models
+from models import StrategyRequest, StrategyResponse
 
-class StartMessage(Model):
-    """Message to start the agent's trading activity."""
-    pass
-
-class StopMessage(Model):
-    """Message to stop the agent's trading activity."""
-    pass
-
-class StatusRequest(Model):
-    """Message to request the agent's current status."""
-    pass
-
-class StatusResponse(Model):
-    """Message containing the agent's current status."""
-    active: bool
-    pnl: float
-    trades_executed: int
-
-# --- Agent Definition ---
-
-# This will be our core Martian agent
+# This will be our core Martian user-facing agent
+# It's configured for local testing and to be published to Agentverse
 agent = Agent(
-    name="martian_arbitrage_agent",
+    name="martian_user_agent",
     port=8001,
-    seed="martian_arbitrage_agent_secret_seed_phrase",
+    seed="martian_user_agent_secret_seed_phrase",
     endpoint=["http://127.0.0.1:8001/submit"],
 )
 
-# --- Agent State ---
+# Ensure the agent has funds to register on Agentverse
+fund_agent_if_low(agent.wallet.address())
 
-# In-memory state for the agent.
-# In a real application, this would be persisted using agent.storage
-agent_state = {
-    "active": False,
-    "pnl": 0.0,
-    "trades_executed": 0,
-}
+# Initialize the chat protocol with the standard chat spec
+chat_proto = Protocol(spec=chat_protocol_spec)
 
-# --- Message Handlers for CLI and API ---
+# Utility function to wrap plain text into a ChatMessage
+def create_text_chat(text: str) -> ChatMessage:
+    content = [TextContent(type="text", text=text)]
+    return ChatMessage(
+        timestamp=datetime.now(timezone.utc),
+        msg_id=uuid4(),
+        content=content,
+    )
 
-@agent.on_message(model=StartMessage)
-async def start_agent(ctx: Context, sender: str, _msg: StartMessage):
-    ctx.logger.info(f"Received start command from {sender}")
-    if not agent_state["active"]:
-        agent_state["active"] = True
-        ctx.logger.info("Agent is now ACTIVE and monitoring for arbitrage opportunities.")
-    else:
-        ctx.logger.info("Agent is already active.")
+# Hardcoded address for the Strategy Agent
+STRATEGY_AGENT_ADDRESS = "agent1qwyge45dyc50m3ka2s9k4ug44jv9cpmchl5htck3jtfe398m9e9fy5svww8"
 
-@agent.on_message(model=StopMessage)
-async def stop_agent(ctx: Context, sender: str, _msg: StopMessage):
-    ctx.logger.info(f"Received stop command from {sender}")
-    if agent_state["active"]:
-        agent_state["active"] = False
-        ctx.logger.info("Agent has been STOPPED.")
-    else:
-        ctx.logger.info("Agent is already stopped.")
 
-@agent.on_message(model=StatusRequest)
-async def get_status(ctx: Context, sender: str, _msg: StatusRequest):
-    ctx.logger.info(f"Received status request from {sender}")
-    await ctx.send(sender, StatusResponse(
-        active=agent_state["active"],
-        pnl=agent_state["pnl"],
-        trades_executed=agent_state["trades_executed"],
-    ))
+# Handle incoming chat messages from the API
+@chat_proto.on_message(ChatMessage)
+async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
+    ctx.logger.info(f"Received message from {sender}")
 
-# --- Core Arbitrage Logic ---
+    for item in msg.content:
+        if isinstance(item, TextContent):
+            ctx.logger.info(f"Text message from {sender}: {item.text}")
 
-@agent.on_interval(period=15.0)
-async def monitor_dexs(ctx: Context):
-    if not agent_state["active"]:
-        # Do nothing if the agent is not active
-        return
+            # Create a strategy request
+            strategy_request = StrategyRequest(user_query=item.text, session_id=str(ctx.session))
+            ctx.logger.info(f"Forwarding query to Strategy Agent: {item.text}")
 
-    ctx.logger.info("Checking for arbitrage opportunities...")
-    # In the future, this is where the logic will go:
-    # 1. Fetch prices from Raydium, Orca, SegaSwap.
-    # 2. Analyze for profitable arbitrage opportunities.
-    # 3. If opportunity found:
-    #    a. Construct transactions.
-    #    b. Use Sanctum Gateway to build and send the transaction bundle.
-    #    c. Update P&L and trade count.
-    pass
+            # Use send_and_receive to wait for the strategy agent's response
+            # NOTE: This makes the API call synchronous from the user's perspective
+            strategy_response, status = await ctx.send_and_receive(
+                STRATEGY_AGENT_ADDRESS,
+                strategy_request,
+                response_type=StrategyResponse,
+                timeout=30, # Add a 30-second timeout
+            )
+
+            if status.status == DeliveryStatus.DELIVERED and isinstance(strategy_response, StrategyResponse):
+                ctx.logger.info(f"Received strategy response: {strategy_response.strategy_description}")
+                response_message = create_text_chat(strategy_response.strategy_description)
+            else:
+                ctx.logger.error(f"Failed to get strategy from agent: {status.detail if status else 'timeout'}")
+                response_message = create_text_chat("Error: Could not get a strategy at this time.")
+
+            # Send the final response back to the original sender (the API)
+            await ctx.send(sender, response_message)
+
+@chat_proto.on_message(ChatAcknowledgement)
+async def handle_acknowledgement(ctx: Context, sender: str, msg: ChatAcknowledgement):
+    ctx.logger.info(f"Received acknowledgement from {sender} for message {msg.acknowledged_msg_id}")
+
+# Include the chat protocol and publish the manifest to Agentverse
+agent.include(chat_proto, publish_manifest=True)
 
 if __name__ == "__main__":
+    print(f"Agent running with address: {agent.address}")
     agent.run()
